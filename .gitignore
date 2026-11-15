@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- project-specific ---
+# experiment outputs (train.py, evaluate.py, export_onnx.py, smoke_test.sh)
+runs/
+out/
+*.pt
+*.onnx
+*.jit
+# manuscripts and the documents generated from them are not part of the code repository
+*.docx

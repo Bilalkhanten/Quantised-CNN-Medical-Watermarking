@@ -1,0 +1,16 @@
+torch>=2.1
+numpy
+scipy
+scikit-image
+scikit-learn
+opencv-python-headless
+pillow
+pydicom
+cryptography
+galois            # BCH(511,385,t=14)
+pytorch-msssim
+onnx
+onnxruntime
+matplotlib
+lxml
+python-docx
