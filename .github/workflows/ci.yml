@@ -1,0 +1,138 @@
+name: CI
+
+# Pipeline graph (arrows are `needs:`):
+#
+#   lint ──┬──▶ unit-tests ──┐
+#          │                 ├──▶ synthetic-run
+#          └──▶ smoke ───────┘
+#
+# lint           ruff, errors only (syntax errors, undefined names); the code is not reformatted
+# unit-tests     tests/: Table 6 parameter and MAC counts, pruning, Haar transform, attack layer, payload chain
+#                (AES/HMAC + BCH: round trip, wrong key, other metadata, t = 14 error correction)
+# smoke          smoke_test.sh (compiles every script, payload demo, regenerates the figures; uploaded)
+# synthetic-run  the whole chain on a tiny SYNTHETIC set: 4-stage training -> evaluation (alpha calibrated to 40 dB)
+#                -> ONNX export -> statistics
+#
+# Everything here exercises the CODE PATH. No number produced by CI is a result: the synthetic run uses random images and an
+# untrained model (see "Read this first" in the README); real data and device measurements are not part of CI.
+# "Run workflow" on the Actions tab starts the pipeline by hand (workflow_dispatch).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Ruff (errors only)
+        run: |
+          python -m pip install --upgrade pip ruff
+          ruff check --isolated --select E9,F63,F7,F82 .
+
+  unit-tests:
+    name: unit-tests
+    needs: [lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU PyTorch, then requirements.txt)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt pytest
+      - run: python -m pytest tests -q
+
+  smoke:
+    name: smoke
+    needs: [lint]
+    runs-on: ubuntu-latest
+    env:
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU PyTorch, then requirements.txt)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt
+      - run: bash smoke_test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: figures
+          path: out/*.png
+          retention-days: 14
+
+  synthetic-run:
+    name: synthetic-run
+    needs: [unit-tests, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU PyTorch, then requirements.txt)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt
+      - name: Train, 4 stages on 16 synthetic images (1 epoch each; the model stays at chance level)
+        working-directory: pipeline
+        run: python train.py --synthetic 16 --out runs/syn --seed 0 --e1 1 --e2 1 --e2_ft 1 --e3 1 --e4_slim 1 --e4_ft 1 --curriculum_epochs 1 --bs 4 --workers 0
+      - name: Evaluate the final (INT8-simulated) and the FP32 model
+        working-directory: pipeline
+        run: |
+          python evaluate.py --run runs/syn --synthetic 16 --seed 100 --out runs/syn/eval.json
+          python evaluate.py --run runs/syn --which fp32 --synthetic 16 --seed 100 --out runs/syn/eval_fp32.json
+      - name: Export to ONNX (FP32 and INT8) at the calibrated strength
+        working-directory: pipeline
+        run: |
+          ALPHA=$(python -c "import json; print(json.load(open('runs/syn/eval.json'))['alpha'])")
+          python export_onnx.py --run runs/syn --synthetic --alpha "$ALPHA"
+      - name: Statistics summary
+        working-directory: pipeline
+        run: python stats.py summary runs/syn/eval.json
+      - name: The chain produced what the README says it does
+        working-directory: pipeline
+        run: |
+          python - <<'PY'
+          import json
+          r = json.load(open("runs/syn/eval.json"))
+          psnr = sum(r["fidelity"]["psnr"]) / len(r["fidelity"]["psnr"])
+          assert abs(psnr - 40) < 1.0, f"alpha calibration missed the 40 dB operating point: {psnr:.2f} dB"
+          o = json.load(open("runs/syn/onnx/onnx_report.json"))
+          assert o["enc_fp32_max_abs_diff_vs_torch"] < 1e-5, o
+          assert o["dec_fp32_max_abs_diff_vs_torch"] < 1e-5, o
+          assert o["enc_int8_bytes"] < o["enc_fp32_bytes"] and o["dec_int8_bytes"] < o["dec_fp32_bytes"], o
+          print(f"calibrated PSNR {psnr:.2f} dB; ONNX FP32 matches PyTorch to {o['enc_fp32_max_abs_diff_vs_torch']:.1e} / {o['dec_fp32_max_abs_diff_vs_torch']:.1e}")
+          PY
